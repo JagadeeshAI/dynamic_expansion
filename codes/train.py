@@ -1,375 +1,296 @@
-#!/usr/bin/env python3
-"""Training script for sentence triplet prediction."""
+"""Train MMLU model with validation subset evaluation."""
 
+import os
+import json
 import torch
-import torch.nn.functional as F
-from torch.optim import AdamW
+import random
 from tqdm import tqdm
-import argparse
+from torch.utils.data import Subset
+from codes.data import get_dataloader, MMLUDataset
+from codes.utils import get_model, calculate_exact_match
 
-from data import get_dataloaders
-from utils import get_model, calculate_token_accuracy, calculate_exact_match, load_checkpoint
 
-
-def train_epoch(model, train_loader, optimizer, device, epoch, tokenizer):
-    """Train for one epoch and track which samples are learned."""
+def train_epoch(model, tokenizer, loader, optimizer, device, eos_weight=3.0):
+    """Train for one epoch."""
     model.train()
     total_loss = 0
-    total_token_acc = 0
-    exact_match_count = 0
-    num_batches = 0
-    learned_sample_ids = set()  # Track which samples got exact match
+    exact_matches = 0
+    total_samples = 0
 
-    for batch_idx, batch in enumerate(train_loader):
-        # Move to device
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        labels = batch['labels'].to(device)
-        # Forward pass (without labels to get raw logits)
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        )
+    pbar = tqdm(loader, desc="Training")
+    for batch in pbar:
+        question = batch['question'][0]
+        answer = batch['answer'][0]
 
+        # Format prompt - add EOS token to answer for proper stopping
+        prompt = f"Question: {question}\nAnswer:"
+        full_text = f"{prompt} {answer}{tokenizer.eos_token}"
+
+        # Calculate max_length dynamically based on this sample
+        max_length = len(tokenizer(full_text, return_tensors="pt")['input_ids'][0]) + 10  # +10 buffer
+
+        # Tokenize with dynamic max_length
+        inputs = tokenizer(full_text, return_tensors="pt", truncation=True, max_length=max_length, padding=True).to(device)
+        prompt_inputs = tokenizer(prompt, return_tensors="pt", padding=True)
+        prompt_len = len(prompt_inputs['input_ids'][0])
+
+        # Calculate max_new_tokens for generation
+        max_new_tokens = max_length - prompt_len
+
+        # Create labels (only compute loss on answer tokens including EOS)
+        labels = inputs['input_ids'].clone()
+        labels[:, :prompt_len] = -100
+
+        # Forward pass with weighted loss
+        outputs = model(**inputs, labels=labels)
         logits = outputs.logits
-        
-        # Calculate custom weighted loss
-        # Shift logits and labels for next-token prediction
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-        
-        # Create loss weights - 3.0 for EOS token, 1.0 for others
+
+        # Calculate weighted cross-entropy loss
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        # Create loss weights with EOS weight
         loss_weights = torch.ones_like(shift_labels, dtype=torch.float)
-        eos_token_id = tokenizer.eos_token_id
-        loss_weights[shift_labels == eos_token_id] = 3.0
-        
-        # Calculate weighted cross entropy loss
+        eos_positions = (shift_labels == tokenizer.eos_token_id)
+        loss_weights[eos_positions] = eos_weight
+
+        # Compute weighted loss
         loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-        flat_logits = shift_logits.view(-1, shift_logits.size(-1))
-        flat_labels = shift_labels.view(-1)
-        flat_weights = loss_weights.view(-1)
-        
-        # Only compute loss where labels != -100
-        active_loss = flat_labels != -100
-        if active_loss.any():
-            active_logits = flat_logits[active_loss]
-            active_labels = flat_labels[active_loss]
-            active_weights = flat_weights[active_loss]
-            
-            token_losses = loss_fct(active_logits, active_labels)
-            weighted_losses = token_losses * active_weights
-            loss = weighted_losses.mean()
-        else:
-            loss = torch.tensor(0.0, requires_grad=True, device=device)
+        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        loss = loss.view(shift_labels.size())
+
+        # Apply weights and mask padding
+        mask = (shift_labels != -100).float()
+        loss = (loss * loss_weights * mask).sum() / mask.sum()
 
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # Calculate metrics (reuse the shift_logits and shift_labels from loss calculation)
-        predictions = torch.argmax(shift_logits, dim=-1)
-        token_acc = calculate_token_accuracy(predictions, shift_labels)
-
-        # Check if this sample achieved exact match during training
-        with torch.no_grad():
-            pred_tokens = predictions[0]
-            label_tokens = shift_labels[0]
-            mask = label_tokens != -100
-            if mask.sum() > 0:
-                matches = (pred_tokens[mask] == label_tokens[mask]).all()
-                if matches:
-                    exact_match_count += 1
-                    learned_sample_ids.add(batch_idx)
-
-        # Update running stats
         total_loss += loss.item()
-        total_token_acc += token_acc
-        num_batches += 1
+        total_samples += 1
+
+        # Calculate EM from logits (no generation needed - much faster!)
+        with torch.no_grad():
+            # Get predicted tokens from logits
+            predictions = torch.argmax(logits, dim=-1)
+
+            # logits[i] predicts token at position i+1, so shift predictions
+            # predictions[:-1] corresponds to inputs['input_ids'][1:]
+            answer_start = prompt_len
+            answer_end = (labels[0] != -100).nonzero()[-1].item() + 1 if (labels[0] != -100).any() else answer_start
+
+            # Extract answer tokens (accounting for the shift)
+            pred_answer = predictions[0, answer_start-1:answer_end-1]
+            true_answer = inputs['input_ids'][0, answer_start:answer_end]
+
+            # Check exact match
+            if len(pred_answer) == len(true_answer) and torch.equal(pred_answer, true_answer):
+                exact_matches += 1
+
+        pbar.set_postfix({'loss': f'{loss.item():.4f}', 'EM': f'{exact_matches}/{total_samples}'})
+
+    return total_loss / total_samples, exact_matches, total_samples
 
 
-    avg_loss = total_loss / num_batches
-    avg_token_acc = total_token_acc / num_batches
-
-    return avg_loss, avg_token_acc, learned_sample_ids
-
-
-def evaluate(model, val_loader, tokenizer, device, epoch, learned_sample_ids=None):
-    """Evaluate on validation set, optionally only on learned samples."""
-
-    # Skip evaluation if no samples have been learned yet
-    if learned_sample_ids is not None and len(learned_sample_ids) == 0:
-        print(f"No samples learned yet - skipping evaluation\n")
-        return 0.0, 0
-
+def evaluate(model, tokenizer, loader, device):
+    """Evaluate on validation subset."""
     model.eval()
-    total_token_acc = 0
-    exact_match_count = 0
-    num_batches = 0
-    tested_samples = 0
-    printed_sample = False  # Track if we've printed one sample
+    exact_matches = 0
+    total_samples = 0
+    failed_samples = []
 
-    # Create progress bar with correct total
-    total_eval_samples = len(learned_sample_ids)
-    pbar = tqdm(total=total_eval_samples, desc=f"Epoch {epoch} [EVAL]")
-
+    pbar = tqdm(loader, desc="Evaluating")
     with torch.no_grad():
-        for batch_idx, batch in enumerate(val_loader):
-            # Only evaluate learned samples
-            if batch_idx not in learned_sample_ids:
-                continue
+        for batch in pbar:
+            question = batch['question'][0]
+            answer = batch['answer'][0]
 
-            tested_samples += 1
+            prompt = f"Question: {question}\nAnswer:"
+            inputs = tokenizer(prompt, return_tensors="pt", padding=True).to(device)
 
-            # Move to device
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            ground_truth = batch['ground_truth'][0]  # batch_size=1
+            # Calculate dynamic max_new_tokens (estimate: answer length + buffer)
+            estimated_answer_tokens = len(tokenizer(answer, return_tensors="pt")['input_ids'][0])
+            max_new_tokens = min(estimated_answer_tokens + 20, 200)  # Cap at 200
 
-
-            # Generate prediction
-            generated_ids = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=100,
+            # Generate
+            generated = model.generate(
+                inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                max_new_tokens=max_new_tokens,
                 do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id
             )
 
-            # Decode prediction (remove prompt)
-            prompt_length = input_ids.shape[1]
-            generated_text = tokenizer.decode(
-                generated_ids[0][prompt_length:],
-                skip_special_tokens=True
-            ).strip()
-
-            # Print only one sample for debugging
-            if not printed_sample:
-                # Decode prompt for printing
-                prompt_text = tokenizer.decode(input_ids[0], skip_special_tokens=True).strip()
-                
-                # Print the prompt, generated text, and correct answer
-                print(f"\n--- Sample {tested_samples} ---")
-                print(f"Prompt: {prompt_text}")
-                print(f"Generated: {generated_text}")
-                print(f"Correct Answer: {ground_truth}")
-                print(f"Exact Match: {'✓' if calculate_exact_match(generated_text, ground_truth) else '✗'}")
-                print("-" * 50)
-                printed_sample = True
+            pred_text = tokenizer.decode(generated[0][len(inputs.input_ids[0]):], skip_special_tokens=True).strip()
 
             # Check exact match
-            is_exact_match = calculate_exact_match(generated_text, ground_truth)
-            if is_exact_match:
-                exact_match_count += 1
+            is_match = calculate_exact_match(pred_text, answer)
+            if is_match:
+                exact_matches += 1
+            else:
+                failed_samples.append({
+                    'prompt': prompt,
+                    'generated': pred_text,
+                    'expected': answer
+                })
 
-            # Calculate token accuracy on ground truth
-            ground_truth_ids = batch['ground_truth_ids'][0].to(device)
+            total_samples += 1
+            pbar.set_postfix({'EM': f'{exact_matches}/{total_samples}'})
 
-            # Build full sequence: prompt + ground_truth for teacher forcing
-            full_input_ids = torch.cat([input_ids[0], ground_truth_ids], dim=0).unsqueeze(0)
-            full_attention_mask = torch.ones_like(full_input_ids)
-
-            # Get logits for full sequence
-            outputs = model(
-                input_ids=full_input_ids,
-                attention_mask=full_attention_mask
-            )
-
-            # Extract logits that predict ground_truth tokens
-            # logits at position i predict token at position i+1
-            # So logits[prompt_len-1:prompt_len+gt_len-1] predict ground_truth_ids
-            prompt_len = input_ids.shape[1]
-            gt_len = len(ground_truth_ids)
-
-            # Get the logits that predict the ground truth tokens
-            pred_logits = outputs.logits[0, prompt_len-1:prompt_len+gt_len-1, :]
-            predictions = torch.argmax(pred_logits, dim=-1)
-
-            # Ensure same length
-            min_len = min(len(predictions), len(ground_truth_ids))
-            predictions = predictions[:min_len]
-            ground_truth_ids_trimmed = ground_truth_ids[:min_len]
-
-            token_acc = calculate_token_accuracy(predictions.unsqueeze(0), ground_truth_ids_trimmed.unsqueeze(0))
-
-            total_token_acc += token_acc
-            num_batches += 1
-
-            # Update progress bar
-            pbar.update(1)
-            pbar.set_postfix({
-                'token_acc': f'{token_acc:.2f}%',
-                'exact_match': f'{exact_match_count}/{tested_samples}',
-                'avg_token_acc': f'{total_token_acc/num_batches:.2f}%'
-            })
-
-    pbar.close()
-
-    avg_token_acc = total_token_acc / num_batches if num_batches > 0 else 0.0
-
-    print(f"\n{'='*60}")
-    print(f"Epoch {epoch} Evaluation Results:")
-    print(f"Tested Samples: {tested_samples} (only learned samples)")
-    print(f"Token Accuracy: {avg_token_acc:.2f}%")
-    print(f"Exact Match Count: {exact_match_count}/{tested_samples}")
-    print(f"{'='*60}\n")
-
-    return avg_token_acc, exact_match_count
+    return exact_matches, total_samples, failed_samples
 
 
-def main(args):
-    """Main training loop."""
+def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
 
-    # Load model and tokenizer
-    model, tokenizer = get_model(args.model_name, device)
+    # Load model
+    model, tokenizer = get_model()
+
+    # Progressive expansion settings
+    current_samples = 1000
+    expansion_increment = 200
+    val_em_threshold = 95.0    # Val EM must be >= 95% to expand
+    expansion_history = []
+    capacity_limit_found = False
+    capacity_limit = None
 
     # Optimizer
-    optimizer = AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4)
 
-    # Resume from checkpoint if specified
-    start_epoch = 1
-    if args.resume:
-        checkpoint = load_checkpoint(args.resume, model, optimizer, device)
+    # Load checkpoint if exists
+    checkpoint_path = "checkpoints/best.pth"
+    os.makedirs("checkpoints", exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
+
+    start_epoch = 0
+    best_em = 0
+
+    if os.path.exists(checkpoint_path):
+        print(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint.get('epoch', 0) + 1
+        best_em = checkpoint.get('best_em', 0)
+        current_samples = checkpoint.get('current_samples', 1000)
+        expansion_history = checkpoint.get('expansion_history', [])
+        capacity_limit_found = checkpoint.get('capacity_limit_found', False)
+        capacity_limit = checkpoint.get('capacity_limit', None)
+        print(f"Resumed from epoch {start_epoch}, best EM: {best_em}")
+        print(f"Current samples: {current_samples}\n")
 
-    # Get total number of samples
-    import json
-    with open(args.data_path, 'r') as f:
-        total_samples = sum(1 for _ in f)
-
-    print(f"Total samples in dataset: {total_samples}")
-    print(f"One epoch = training on [0], [0,1], [0,1,2], ..., [0,1,...,{total_samples-1}]\n")
-
-    # Track learned samples across all epochs
-    all_learned_samples = set()
-    best_exact_match = 0
-
-    # Training loop - each epoch goes through full curriculum
-    for epoch in range(start_epoch, args.epochs + 1):
+    # Training loop
+    num_epochs = 100
+    for epoch in range(start_epoch, num_epochs):
         print(f"\n{'='*60}")
-        print(f"EPOCH {epoch}/{args.epochs}")
-        print(f"{'='*60}\n")
+        print(f"Epoch {epoch+1}/{num_epochs}")
+        print(f"Dataset size: {current_samples} samples (indices: 0-{current_samples-1})")
+        print(f"{'='*60}")
 
-        # Reset learned samples for this epoch
-        epoch_learned_samples = set()
+        # Load dataset with current sample size
+        dataset = MMLUDataset("data/mmlu_combined.jsonl", max_samples=current_samples)
+        train_loader = get_dataloader("data/mmlu_combined.jsonl", shuffle=True, max_samples=current_samples)
 
-        # Bidirectional curriculum learning:
-        # Odd epochs (1,3,5,...): forward 1→N
-        # Even epochs (2,4,6,...): backward N→1
-        if epoch % 2 == 1:
-            # Odd epoch: forward
-            curriculum_range = range(1, total_samples + 1)
-            direction = "forward (1→N)"
-        else:
-            # Even epoch: backward
-            curriculum_range = range(total_samples, 0, -1)
-            direction = "backward (N→1)"
+        # Train
+        train_loss, train_em, train_total = train_epoch(model, tokenizer, train_loader, optimizer, device, eos_weight=3.0)
+        train_em_percent = (train_em / train_total) * 100
+        print(f"\nTrain Loss: {train_loss:.4f} | Train EM: {train_em}/{train_total} ({train_em_percent:.2f}%)")
 
-        print(f"Curriculum direction: {direction}\n")
+        # Validation on random 10% subset (always randomized from current training data)
+        val_size = int(0.1 * len(dataset))
+        val_indices = random.sample(range(len(dataset)), val_size)
+        val_subset = Subset(dataset, val_indices)
+        val_loader = torch.utils.data.DataLoader(val_subset, batch_size=1, shuffle=False)
 
-        # One epoch = curriculum from 1 sample to N samples (or reverse)
-        curriculum_pbar = tqdm(curriculum_range, desc=f"Epoch {epoch}/{args.epochs}")
-        for curriculum_step in curriculum_pbar:
+        val_em, val_total, failed = evaluate(model, tokenizer, val_loader, device)
+        val_em_percent = (val_em / val_total) * 100
+        print(f"Val EM: {val_em}/{val_total} ({val_em_percent:.2f}%)")
 
-            # Get dataloaders for this curriculum step
-            train_loader, val_loader = get_dataloaders(
-                data_path=args.data_path,
-                tokenizer=tokenizer,
-                batch_size=1,
-                val_size=args.val_size,
-                max_samples=curriculum_step
-            )
-            # Train on this curriculum step
-            train_loss, train_token_acc, learned_sample_ids = train_epoch(
-                model, train_loader, optimizer, device,
-                f"{epoch}.{curriculum_step}", tokenizer
-            )
+        # Print failed samples
+        if failed:
+            print(f"\nFailed samples ({len(failed)}):")
+            for i, sample in enumerate(failed[:5]):  # Show first 5
+                print(f"\n{i+1}. Prompt: {sample['prompt']}")
+                print(f"   Generated: {sample['generated']}")
+                print(f"   Expected: {sample['expected']}")
 
-            # Accumulate learned samples for this epoch
-            epoch_learned_samples.update(learned_sample_ids)
-            all_learned_samples.update(learned_sample_ids)
-
-            # Update curriculum progress bar
-            curriculum_pbar.set_postfix({
-                'loss': f'{train_loss:.4f}',
-                'token_acc': f'{train_token_acc:.2f}%',
-                'learned': len(epoch_learned_samples)
-            })
-
-
-        # After completing full curriculum (one epoch), evaluate
-        print(f"\n{'='*60}")
-        print(f"EPOCH {epoch} COMPLETED - Evaluating on learned samples")
-        print(f"{'='*60}\n")
-
-        if len(epoch_learned_samples) > 0:
-            # Get validation loader with all samples for evaluation
-            _, val_loader = get_dataloaders(
-                data_path=args.data_path,
-                tokenizer=tokenizer,
-                batch_size=1,
-                val_size=args.val_size,
-                max_samples=None  # All samples
-            )
-
-            print(f"Evaluating on {len(epoch_learned_samples)} learned samples from this epoch...")
-            val_token_acc, exact_match_count = evaluate(
-                model, val_loader, tokenizer, device, epoch,
-                learned_sample_ids=epoch_learned_samples
-            )
-        else:
-            print(f"No samples learned yet - skipping evaluation\n")
-            val_token_acc = 0.0
-            exact_match_count = 0
-
-        # Save checkpoint after each epoch
-        checkpoint_path = f"{args.output_dir}/checkpoint_epoch_{epoch}.pt"
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'val_token_acc': val_token_acc,
-            'exact_match_count': exact_match_count,
-            'learned_samples': list(all_learned_samples)
-        }, checkpoint_path)
-        print(f"Saved checkpoint: {checkpoint_path}")
-
-        # Save best model if exact match improved
-        if exact_match_count > best_exact_match:
-            best_exact_match = exact_match_count
-            best_model_path = f"{args.output_dir}/best.pth"
+        # Save checkpoint if best
+        if val_em > best_em:
+            best_em = val_em
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'val_token_acc': val_token_acc,
-                'exact_match_count': exact_match_count,
-                'learned_samples': list(all_learned_samples)
-            }, best_model_path)
-            print(f"✓ New best model saved! Exact match: {exact_match_count} (improved from {best_exact_match - exact_match_count})")
-        print()
+                'best_em': best_em,
+                'current_samples': current_samples,
+                'expansion_history': expansion_history,
+                'capacity_limit_found': capacity_limit_found,
+                'capacity_limit': capacity_limit
+            }, checkpoint_path)
+            print(f"\n✓ Saved best checkpoint with EM: {best_em}/{val_total}")
 
-    print("\nTraining completed!")
+        # Check for dataset expansion (only val EM >= 95%)
+        if not capacity_limit_found and val_em_percent >= val_em_threshold:
+            # Record current state before expansion
+            expansion_record = {
+                'samples': current_samples,
+                'indices': f"0-{current_samples-1}",
+                'epoch': epoch + 1,
+                'train_em': train_em,
+                'train_total': train_total,
+                'train_em_percent': train_em_percent,
+                'val_em': val_em,
+                'val_total': val_total,
+                'val_em_percent': val_em_percent,
+                'val_failed_count': len(failed),
+                'val_failed_samples': failed[:10],  # Store first 10 failed samples
+                'expanded': True
+            }
+            expansion_history.append(expansion_record)
+
+            # Expand dataset
+            previous_samples = current_samples
+            current_samples += expansion_increment
+
+            print(f"\n{'='*60}")
+            print(f"🚀 EXPANSION TRIGGERED!")
+            print(f"Val EM: {val_em_percent:.2f}% >= {val_em_threshold}%")
+            print(f"Expanding dataset: {previous_samples} → {current_samples} samples")
+            print(f"New indices: 0-{current_samples-1}")
+            print(f"{'='*60}\n")
+
+        elif not capacity_limit_found and val_em_percent < val_em_threshold:
+            # Check if we just expanded and performance dropped
+            if expansion_history and expansion_history[-1]['samples'] < current_samples:
+                capacity_limit_found = True
+                capacity_limit = expansion_history[-1]['samples']
+
+                print(f"\n{'='*60}")
+                print(f"⚠️  CAPACITY LIMIT DETECTED!")
+                print(f"Val EM: {val_em_percent:.2f}% (threshold: {val_em_threshold}%)")
+                print(f"Capacity limit: {capacity_limit} samples")
+                print(f"Reverting to previous dataset size")
+                print(f"{'='*60}\n")
+
+                # Revert to capacity limit
+                current_samples = capacity_limit
+
+        # Save expansion history to JSON
+        history_data = {
+            'expansion_history': expansion_history,
+            'capacity_limit_found': capacity_limit_found,
+            'capacity_limit': capacity_limit,
+            'current_samples': current_samples,
+            'final_indices': f"0-{current_samples-1}"
+        }
+
+        with open('logs/expansion_history.json', 'w') as f:
+            json.dump(history_data, f, indent=2)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train sentence triplet model")
-    parser.add_argument("--model_name", type=str, default="meta-llama/Llama-2-7b-hf", help="Model name")
-    parser.add_argument("--data_path", type=str, default="data/data.jsonl", help="Path to data JSONL")
-    parser.add_argument("--output_dir", type=str, default="checkpoints", help="Output directory")
-    parser.add_argument("--epochs", type=int, default=10, help="Number of epochs")
-    parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate")
-    parser.add_argument("--val_size", type=int, default=50, help="Validation set size")
-    parser.add_argument("--save_every", type=int, default=1, help="Save checkpoint every N epochs")
-    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from (e.g., checkpoints/checkpoint_epoch_1.pt)")
+    main()
 
-    args = parser.parse_args()
-
-    # Create output directory
-    import os
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    main(args)

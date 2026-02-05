@@ -5,7 +5,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-def get_model(model_name: str = "meta-llama/Llama-2-7b-hf", device: str = "cuda"):
+def get_model(model_name: str = "meta-llama/Llama-3.2-1B", device: str = "cuda"):
     """
     Load model and tokenizer with bf16 precision.
     Freeze all layers except FFNs.
@@ -123,7 +123,7 @@ def calculate_exact_match(predicted_text: str, ground_truth: str) -> bool:
         True if match (ignoring punctuation/whitespace), False otherwise
     """
     import re
-    
+
     def normalize_text(text: str) -> str:
         """Normalize text by removing punctuation and extra whitespace, keeping only letters and numbers."""
         # Remove punctuation and keep only alphanumeric characters and spaces
@@ -132,10 +132,10 @@ def calculate_exact_match(predicted_text: str, ground_truth: str) -> bool:
         text = re.sub(r'\s+', ' ', text)
         # Strip and convert to lowercase for comparison
         return text.strip().lower()
-    
+
     normalized_pred = normalize_text(predicted_text)
     normalized_truth = normalize_text(ground_truth)
-    
+
     return normalized_pred == normalized_truth
 
 
