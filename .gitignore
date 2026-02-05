@@ -13,7 +13,6 @@ token.txt
 
 # Large data files
 *.jsonl
-data/
 
 # Python cache
 __pycache__/
@@ -38,7 +37,3 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
-
-# Logs
-*.log
-logs/
