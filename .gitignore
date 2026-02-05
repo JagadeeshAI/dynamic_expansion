@@ -1,0 +1,44 @@
+# Model files
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Checkpoints directory
+checkpoints/
+
+# Secrets and tokens
+token.txt
+*.token
+
+# Large data files
+*.jsonl
+data/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
