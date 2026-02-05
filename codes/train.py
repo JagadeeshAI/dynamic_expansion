@@ -25,28 +25,49 @@ def train_epoch(model, train_loader, optimizer, device, epoch, tokenizer):
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         labels = batch['labels'].to(device)
-
-        # Forward pass
+        # Forward pass (without labels to get raw logits)
         outputs = model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels
+            attention_mask=attention_mask
         )
 
-        loss = outputs.loss
         logits = outputs.logits
+        
+        # Calculate custom weighted loss
+        # Shift logits and labels for next-token prediction
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        
+        # Create loss weights - 3.0 for EOS token, 1.0 for others
+        loss_weights = torch.ones_like(shift_labels, dtype=torch.float)
+        eos_token_id = tokenizer.eos_token_id
+        loss_weights[shift_labels == eos_token_id] = 3.0
+        
+        # Calculate weighted cross entropy loss
+        loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+        flat_logits = shift_logits.view(-1, shift_logits.size(-1))
+        flat_labels = shift_labels.view(-1)
+        flat_weights = loss_weights.view(-1)
+        
+        # Only compute loss where labels != -100
+        active_loss = flat_labels != -100
+        if active_loss.any():
+            active_logits = flat_logits[active_loss]
+            active_labels = flat_labels[active_loss]
+            active_weights = flat_weights[active_loss]
+            
+            token_losses = loss_fct(active_logits, active_labels)
+            weighted_losses = token_losses * active_weights
+            loss = weighted_losses.mean()
+        else:
+            loss = torch.tensor(0.0, requires_grad=True, device=device)
 
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # Calculate metrics
-        # Shift logits and labels for next-token prediction
-        # logits[:, :-1, :] predicts labels[:, 1:]
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-
+        # Calculate metrics (reuse the shift_logits and shift_labels from loss calculation)
         predictions = torch.argmax(shift_logits, dim=-1)
         token_acc = calculate_token_accuracy(predictions, shift_labels)
 
@@ -82,18 +103,20 @@ def evaluate(model, val_loader, tokenizer, device, epoch, learned_sample_ids=Non
         return 0.0, 0
 
     model.eval()
-    total_loss = 0
     total_token_acc = 0
     exact_match_count = 0
     num_batches = 0
     tested_samples = 0
+    printed_sample = False  # Track if we've printed one sample
 
-    pbar = tqdm(val_loader, desc=f"Epoch {epoch} [EVAL]")
+    # Create progress bar with correct total
+    total_eval_samples = len(learned_sample_ids)
+    pbar = tqdm(total=total_eval_samples, desc=f"Epoch {epoch} [EVAL]")
 
     with torch.no_grad():
-        for batch_idx, batch in enumerate(pbar):
-            # If we're only evaluating learned samples, skip others
-            if learned_sample_ids is not None and batch_idx not in learned_sample_ids:
+        for batch_idx, batch in enumerate(val_loader):
+            # Only evaluate learned samples
+            if batch_idx not in learned_sample_ids:
                 continue
 
             tested_samples += 1
@@ -120,6 +143,20 @@ def evaluate(model, val_loader, tokenizer, device, epoch, learned_sample_ids=Non
                 generated_ids[0][prompt_length:],
                 skip_special_tokens=True
             ).strip()
+
+            # Print only one sample for debugging
+            if not printed_sample:
+                # Decode prompt for printing
+                prompt_text = tokenizer.decode(input_ids[0], skip_special_tokens=True).strip()
+                
+                # Print the prompt, generated text, and correct answer
+                print(f"\n--- Sample {tested_samples} ---")
+                print(f"Prompt: {prompt_text}")
+                print(f"Generated: {generated_text}")
+                print(f"Correct Answer: {ground_truth}")
+                print(f"Exact Match: {'✓' if calculate_exact_match(generated_text, ground_truth) else '✗'}")
+                print("-" * 50)
+                printed_sample = True
 
             # Check exact match
             is_exact_match = calculate_exact_match(generated_text, ground_truth)
@@ -160,11 +197,14 @@ def evaluate(model, val_loader, tokenizer, device, epoch, learned_sample_ids=Non
             num_batches += 1
 
             # Update progress bar
+            pbar.update(1)
             pbar.set_postfix({
                 'token_acc': f'{token_acc:.2f}%',
                 'exact_match': f'{exact_match_count}/{tested_samples}',
                 'avg_token_acc': f'{total_token_acc/num_batches:.2f}%'
             })
+
+    pbar.close()
 
     avg_token_acc = total_token_acc / num_batches if num_batches > 0 else 0.0
 

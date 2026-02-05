@@ -50,9 +50,10 @@ class TripletDataset(Dataset):
         s1, s2, s3 = item['s1'], item['s2'], item['s3']
 
         if self.mode == "train":
-            # Training: "given s1: {s1} and s2: {s2} predict s3: {s3}"
-            prompt = f"given s1: {s1} and s2: {s2} predict s3: {s3}"
-            # Tokenize full sequence
+            # Training: "### given s1: {s1} ### and s2: {s2} ### predict s3: {s3}" + EOS
+            prompt = f"### given s1: {s1} ### and s2: {s2} ### predict s3: {s3}"
+            
+            # Tokenize the prompt + s3 part
             encoding = self.tokenizer(
                 prompt,
                 add_special_tokens=True,
@@ -60,9 +61,15 @@ class TripletDataset(Dataset):
                 padding=False,
                 truncation=False
             )
-
+            
+            # Add EOS token after S3
             input_ids = encoding['input_ids'].squeeze(0)
+            eos_token_id = self.tokenizer.eos_token_id
+            input_ids = torch.cat([input_ids, torch.tensor([eos_token_id])])
+            
+            # Update attention mask
             attention_mask = encoding['attention_mask'].squeeze(0)
+            attention_mask = torch.cat([attention_mask, torch.tensor([1])])
 
             # Labels are same as input_ids for causal LM
             labels = input_ids.clone()
@@ -73,10 +80,9 @@ class TripletDataset(Dataset):
                 'labels': labels,
                 'length': len(input_ids)
             }
-
         else:  # validation
-            # Validation: "given s1: {s1} and s2: {s2} predict s3: "
-            prompt = f"given s1: {s1} and s2: {s2} predict s3: "
+            # Validation: "### given s1: {s1} ### and s2: {s2} ### predict s3: "
+            prompt = f"### given s1: {s1} ### and s2: {s2} ### predict s3: "
 
             # Tokenize prompt (without s3)
             prompt_encoding = self.tokenizer(
