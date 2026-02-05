@@ -1,0 +1,23 @@
+Using device: cuda
+Loading model: meta-llama/Llama-3.2-1B
+
+============================================================
+Model: meta-llama/Llama-3.2-1B
+Total Parameters: 1,235,814,400
+Trainable Parameters: 1,235,814,400
+Trainable %: 100.00%
+============================================================
+
+Loading checkpoint from checkpoints/checkpoint_epoch_1.pt...
+Resumed from epoch 1
+Previous best exact match: 0
+Previously learned samples: 12
+
+Total samples in dataset: 100
+One epoch = training on [0], [0,1], [0,1,2], ..., [0,1,...,99]
+
+
+============================================================
+EPOCH 2/10
+============================================================
+
